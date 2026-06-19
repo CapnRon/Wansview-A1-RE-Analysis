@@ -37,28 +37,37 @@ to [Thingino](https://thingino.com) open-source firmware.
    - [Base System (A98000)](#61-base-system-a98000)
    - [Application Partition (B40000)](#62-application-partition-b40000)
 7. [JFFS2 Data Partition](#7-jffs2-data-partition)
-8. [Hardware Configuration](#8-hardware-configuration)
-   - [SoC](#81-soc)
-   - [Sensor](#82-sensor)
-   - [WiFi](#83-wifi)
-   - [MCU Co-processor](#84-mcu-co-processor)
-   - [Flash & Storage](#85-flash--storage)
-   - [GPIOs & LEDs](#86-gpios--leds)
-   - [Peripherals](#87-peripherals)
-9. [MTD Partition Layout](#9-mtd-partition-layout)
-10. [SDK Tooling](#10-sdk-tooling)
-    - [mark_rootfs/lzma Tools](#101-mark_rootfslzma-tools)
-    - [Tag Generator](#102-tag-generator)
-    - [librtos / MCU Communication](#103-librtos--mcu-communication)
-11. [Thingino Porting Notes](#11-thingino-porting-notes)
-    - [Board Definition](#111-board-definition)
-    - [Kernel Configuration](#112-kernel-configuration)
-    - [Sensor Integration](#113-sensor-integration)
-    - [WiFi Integration](#114-wifi-integration)
-    - [Tag Partition](#115-tag-partition)
-    - [Partition Layout](#116-partition-layout)
-12. [Tools](#12-tools)
-13. [References](#13-references)
+8. [Audio System](#8-audio-system)
+    - [Kernel Configuration](#81-kernel-configuration)
+    - [OSS3 Audio Driver](#82-oss3-audio-driver)
+    - [Internal Codec](#83-internal-codec)
+    - [IMP Audio API (Userland)](#84-imp-audio-api-userland)
+    - [Audio Processing (WebRTC)](#85-audio-processing-webrtc)
+    - [Firmware Audio Binaries](#86-firmware-audio-binaries)
+    - [Voice Prompts](#87-voice-prompts)
+9. [Hardware Configuration](#9-hardware-configuration)
+    - [SoC](#91-soc)
+    - [Sensor](#92-sensor)
+    - [WiFi](#93-wifi)
+    - [MCU Co-processor](#94-mcu-co-processor)
+    - [Flash & Storage](#95-flash--storage)
+    - [GPIOs & LEDs](#96-gpios--leds)
+    - [Peripherals](#97-peripherals)
+10. [MTD Partition Layout](#10-mtd-partition-layout)
+11. [SDK Tooling](#11-sdk-tooling)
+    - [mark_rootfs/lzma Tools](#111-mark_rootfslzma-tools)
+    - [Tag Generator](#112-tag-generator)
+    - [librtos / MCU Communication](#113-librtos--mcu-communication)
+12. [Thingino Porting Notes](#12-thingino-porting-notes)
+    - [Board Definition](#121-board-definition)
+    - [Kernel Configuration](#122-kernel-configuration)
+    - [Sensor Integration](#123-sensor-integration)
+    - [WiFi Integration](#124-wifi-integration)
+    - [Audio Integration](#125-audio-integration)
+    - [Tag Partition](#126-tag-partition)
+    - [Partition Layout](#127-partition-layout)
+13. [Tools](#13-tools)
+14. [References](#14-references)
 
 ---
 
@@ -532,9 +541,209 @@ profiles/
 
 ---
 
-## 8. Hardware Configuration
+## 8. Audio System
 
-### 8.1 SoC
+The Wansview A1 has a full bidirectional audio subsystem with microphone
+capture and speaker playback support. It uses Ingenic's custom **OSS3**
+(Open Sound System v3) framework with the internal T23 codec, plus a
+WebRTC-based processing stack for echo cancellation, noise suppression,
+and auto gain control.
+
+Audio encoding/decoding supports G.711 A-law, G.711 µ-law, and G.726.
+The device ships with 165 AAC voice prompt files in 12 languages.
+
+### 8.1 Kernel Configuration
+
+| Option                        | Value  | Notes                         |
+|-------------------------------|--------|-------------------------------|
+| `CONFIG_SOUND`                | `y`    | Sound subsystem enabled       |
+| `CONFIG_SOUND_OSS_CORE`       | `y`    | OSS core framework            |
+| `CONFIG_SOUND_PRIME`          | `y`    | Ingenic OSS3 driver           |
+| `CONFIG_SOUND_OSS_XBURST`     | `y`    | XBurst OSS extensions         |
+| `CONFIG_SOUND_JZ_I2S_V12`     | `y`    | I2S v12 interface             |
+| `CONFIG_COMPILE_JZSOUND_INTO_KO` | `y` | Built into kernel, not a module |
+| `CONFIG_SND`                  | `n`    | **ALSA is disabled**          |
+| `CONFIG_SOUND_JZ_PCM_V12`     | `n`    | No PCM interface              |
+| `CONFIG_SOUND_JZ_SPDIF_V12`   | `n`    | No SPDIF                      |
+
+The recovery (Immortal) kernel has **no audio** — `CONFIG_SOUND` is not set.
+
+### 8.2 OSS3 Audio Driver
+
+Source location in the SDK kernel tree:
+
+```
+sound/oss3/
+├── audio_dsp.c                   # /dev/dsp interface
+├── audio_debug.c                 # Debug /proc interface
+├── boards/
+│   └── t23_platform.c            # Platform device registration
+├── host/
+│   └── T23/
+│       ├── audio_aic.c           # Core AIC driver (I2S, DMA, AEC pipes)
+│       └── audio_aic.h           # AIC register definitions
+├── inner_codecs/
+│   └── T23/
+│       ├── codec.c               # Internal T23 codec driver
+│       └── codec.h               # Codec register map
+└── include/
+    ├── audio_common.h
+    ├── audio_control.h
+    ├── audio_debug.h
+    └── audio_dsp.h
+```
+
+**`audio_aic.c`** (`sound/oss3/host/T23/audio_aic.c`):
+
+- Version: `"V30-20230210a"`
+- Module parameters: `internal_codec`, `excodec_name`, `excodec_addr`,
+  `i2c_bus`, `samplerate`, `mic_mono_channel`
+- Three audio pipes: **Mic** (capture), **SPK** (playback), **AEC**
+  (echo cancellation reference), each with dedicated DMA
+- I2S protocol: standard I2S, left-justified, 8/16/20/24-bit samples
+- Sample rates: 8 KHz, 16 KHz (`DEFAULT_RECORD_CLK = 8000*256`)
+- Volume range: -30 to 120 (0.5 dB steps)
+- Gain range: 0-31
+- Features: ALC (Auto Level Control), mute, HPF (High Pass Filter),
+  external codec support via I2C
+
+**`t23_platform.c`** (`sound/oss3/boards/t23_platform.c`) registers:
+
+| Device             | Name              | Base / IRQ                 |
+|--------------------|-------------------|----------------------------|
+| Internal codec     | `"jz-inner-codec"`| `CODEC_IOBASE`             |
+| Audio interface    | `"jz-aic"`        | `AIC0_IOBASE`, `IRQ_AIC0` |
+| DSP endpoint       | `"jz-dsp"`        | `/dev/dsp`                 |
+
+### 8.3 Internal Codec
+
+**`codec.c`** (`sound/oss3/inner_codecs/T23/codec.c`):
+
+- Base address: `0x10021000`
+- Speaker control: `GPIO_PB(31)` with configurable active level
+- Supported sample rates: 8K, 12K, 16K, 24K, 32K, 44.1K, 48K, 96K
+- ADC data lengths: 16-bit, 20-bit, 24-bit, 32-bit
+
+Board-level sound routing is defined in
+`arch/mips/xburst/soc-t23/chip-t23/isvp/common/sound.c`:
+
+```c
+static struct codec_data codec_data = {
+    .replay_def_route  = DACRL_TO_ALL,       // speaker + headphone
+    .record_def_route  = MIC1_AN1,            // built-in microphone
+    .gpio_hp_mute      = GPIO_HP_MUTE,
+    .gpio_speaker_en   = GPIO_SPEAKER_EN,
+    .gpio_hp_detect    = GPIO_HP_DETECT,
+    .gpio_mic_detect   = GPIO_MIC_DETECT,
+    .gpio_mic_select   = GPIO_MIC_SELECT,
+    .gpio_handset_en   = GPIO_HANDSET_EN,
+};
+```
+
+Sound routing options (from `arch/mips/xburst/soc-t23/include/mach/jzsnd.h`):
+
+| Direction | Routes |
+|-----------|--------|
+| Record    | `MIC1_AN1`, `MIC1_SIN_AN2`, `MIC2_SIN_AN3`, `LINEIN1`, `LINEIN2`, call record |
+| Playback  | `DACRL_TO_LO`, `DACRL_TO_HPRL`, `DACRL_TO_ALL` |
+| Loopback  | `LINEIN2` bypass, `MIC` bypass |
+
+### 8.4 IMP Audio API (Userland)
+
+The userland audio API is provided by the Ingenic Multimedia Platform (IMP)
+header at `imp-t23/include_en/imp/imp_audio.h`:
+
+| API Prefix  | Function               | Details                                    |
+|-------------|------------------------|--------------------------------------------|
+| `IMP_AI_*`  | Audio Input (capture)  | Device 0 = digital MIC, Device 1 = analog MIC |
+| `IMP_AO_*`  | Audio Output (playback)| Device 0 = default SPK                     |
+| `IMP_AENC_*`| Audio Encoding         | `PT_G711A`, `PT_G711U`, `PT_G726`          |
+| `IMP_ADEC_*`| Audio Decoding         | `PT_G711A`, `PT_G711U`, `PT_G726`          |
+| `IMP_AI_EnableAec` | Echo Cancellation | WebRTC-based, config via `/etc/webrtc_profile.ini` |
+| `IMP_AI_EnableNs`  | Noise Suppression | 4 levels: Low/Moderate/High/VeryHigh       |
+| `IMP_AI_EnableAgc` | Auto Gain Control | Configurable target level and gain         |
+| `IMP_AI_EnableHpf` | High Pass Filter  | Configurable cutoff frequency              |
+| `IMP_AI_EnableHs`  | Howling Suppression |                                       |
+| `IMP_AI_SetVol`    | Set Volume       | Range -30 to 120 (0.5 dB steps)            |
+| `IMP_AI_SetGain`   | Set Gain         | Range 0-31 (-18 dB to +28.5 dB)            |
+
+Supported sample rates: 8K, 12K, 16K, 24K, 32K, 44.1K, 48K, 96K
+Bit width: 16-bit
+Sound modes: Mono, Stereo
+
+### 8.5 Audio Processing (WebRTC)
+
+The library `libaudioProcess.so` (`imp-t23/lib/uclibc/libaudioProcess.so`)
+provides WebRTC-based real-time audio processing:
+
+```
+libaudioProcess.so exports:
+  audio_process_aec_create / process / free   # Acoustic Echo Cancellation
+  audio_process_ns_create / set_config / process / free  # Noise Suppression
+  audio_process_agc_create / set_config / process / free  # Auto Gain Control
+  audio_process_hpf_create / process / free   # High Pass Filter
+```
+
+References WebRTC internals: `WebRtcAgc_*`, `WebRtcNs_*`,
+`WebRtcNs_Analyze`, `WebRtcNs_Process`
+
+### 8.6 Firmware Audio Binaries
+
+**`ajcloud`** (`bin/ajcloud`, 803 KB) — main application with audio control:
+
+- Protobuf commands: `AudioConfigRequest`, `AudioConfigResponse`,
+  `SoundPlayRequest`, `SoundPlayResponse`, `SoundMonitorConfigRequest`
+- Config: `mic_enable`, `mic_volume`, `speaker_volume`
+- Sounds: `SirenSound`, `SirenSoundsConfigRequest`, `RingSoundConfigRequest`,
+  `AlarmSoundConfigRequest`
+- Callbacks: `audio_config_request_cb`, `audio_config_response_cb`,
+  `sound_play_request_cb`, `sound_play_response_cb`
+
+**`audio_play`** (`bin/audio_play`, 42 KB) — standalone AAC playback tool:
+
+- Uses OSS `/dev/dsp` directly
+- Functions: `IMP_AO_Enable`, `IMP_AO_SetVol`,
+  `SNDCTL_DSP_SETFMT`, `SNDCTL_EXT_ENABLE_STREAM`
+- Loads `libaudioProcess.so` dynamically
+- Supports AAC playback with volume control
+
+**Audio config** from JFFS2 (`profiles/IBT_Profiles.ini`):
+```ini
+[Audio]
+playVol=70
+```
+
+### 8.7 Voice Prompts
+
+The application partition contains **165 AAC sound files** across 12 languages
+in `snd/`:
+
+| Language | Code | Files |
+|----------|------|-------|
+| Chinese  | `zh`  | 17 (including extras: power-on, power-off, siren, ring-1, eagle, du, dudu) |
+| English  | `en`  | 8     |
+| German   | `de`  | 8     |
+| Spanish  | `es`  | 8     |
+| French   | `fr`  | 8     |
+| Italian  | `it`  | 8     |
+| Japanese | `ja`  | 8     |
+| Korean   | `ko`  | 8     |
+| Polish   | `pl`  | 8     |
+| Portuguese| `pt` | 8     |
+| Russian  | `ru`  | 8     |
+
+Standard prompt set (present in all languages):
+`allok`, `pairingfailed`, `qrok`, `registering`, `resetok`,
+`wificonnected`, `wificonnecting`, `wifierror`
+
+Chinese-only additions: `power-off`, `power-on`, `siren`, `ring-1`,
+`eagle`, `du`, `dudu`
+
+---
+
+## 9. Hardware Configuration
+
+### 9.1 SoC
 
 | Property       | Detail                                      |
 |----------------|----------------------------------------------|
@@ -641,7 +850,7 @@ echo 1 > /sys/class/gpio/gpio50/value
 
 ---
 
-## 9. MTD Partition Layout
+## 10. MTD Partition Layout
 
 Based on the firmware image structure and initramfs scripts, the expected
 partition layout for a 16 MB SPI NOR flash is:
@@ -678,7 +887,7 @@ Known tag fields (from `tag_generator` usage):
 
 ---
 
-## 10. SDK Tooling
+## 11. SDK Tooling
 
 The Zeratul SDK (v3.3.0, dated 2023-09-16) was found at:
 
@@ -690,7 +899,7 @@ Zeratul_Release_20230916/tools/
 └── pc_tool/            # Host utilities
 ```
 
-### 10.1 mark_rootfs/lzma Tools
+### 11.1 mark_rootfs/lzma Tools
 
 ```
 tools/mark_rootfs/
@@ -714,7 +923,7 @@ Compression pipeline (from `lzma_enc.sh`):
 rm input_file.lzma jz_lzma_out.bin
 ```
 
-### 10.2 Tag Generator
+### 11.2 Tag Generator
 
 The `tag_generator` binary in the initramfs creates and manages the tag
 partition. It supports subcommands for each field:
@@ -730,7 +939,7 @@ tag_generator --ae_table ae_table_os02g10.bin
 tag_generator --riscv_fw riscv_fw.bin
 ```
 
-### 10.3 librtos / MCU Communication
+### 11.3 librtos / MCU Communication
 
 `librtos.so` implements a custom protocol over `/dev/atbm_ioctl` for
 communicating with the MCU. Functions include:
@@ -744,9 +953,9 @@ int rtos_cmd_mcu_upgrade(fw_data);     // Flash MCU firmware
 
 ---
 
-## 11. Thingino Porting Notes
+## 12. Thingino Porting Notes
 
-### 11.1 Board Definition
+### 12.1 Board Definition
 
 A new board target should be added to Thingino as:
 
@@ -759,7 +968,7 @@ target/linux/ingenic-t23/
         └── patches/                  # Board-specific kernel patches
 ```
 
-### 11.2 Kernel Configuration
+### 12.2 Kernel Configuration
 
 Minimum kernel features required (all confirmed built-in or as modules in
 stock kernel):
@@ -805,7 +1014,7 @@ CONFIG_DMA_JZ=y
 CONFIG_CRYPTO_JZ_AES=y
 ```
 
-### 11.3 Sensor Integration
+### 12.3 Sensor Integration
 
 The OS02G10 sensor driver needs to be ported from the Ingenic SDK or
 mainline. Two approaches:
@@ -819,7 +1028,7 @@ The tag partition approach is fragile (register tables are binary blobs
 tied to a specific board revision). A proper V4L2 sensor driver is
 recommended for Thingino.
 
-### 11.4 WiFi Integration
+### 12.4 WiFi Integration
 
 The atbm6461 SDIO driver and firmware must be included:
 
@@ -846,7 +1055,36 @@ Required firmware files in `/lib/firmware/`:
 - `ApolloD_TC.bin`, `ApolloF_TC.bin` (temperature compensation)
 - `Apollo_FM.bin` (firmware management)
 
-### 11.5 Tag Partition
+### 12.5 Audio Integration
+
+The audio subsystem uses Ingenic's proprietary **OSS3** driver framework,
+not ALSA. Thingino will need to either:
+
+1. **Reuse OSS3 driver sources** (recommended) — the complete driver source
+   is available in the SDK at `sound/oss3/`. Enable in kernel config:
+   ```
+   CONFIG_SOUND=y
+   CONFIG_SOUND_OSS_CORE=y
+   CONFIG_SOUND_PRIME=y
+   CONFIG_SOUND_OSS_XBURST=y
+   CONFIG_SOUND_JZ_I2S_V12=y
+   CONFIG_COMPILE_JZSOUND_INTO_KO=y
+   # CONFIG_SND is not set
+   ```
+
+2. **Replace with ALSA** — write an ALSA SoC driver for the T23 internal
+   codec and I2S interface. This is more work but aligns with mainline.
+
+For the userland audio stack:
+- Port the IMP audio API (`IMP_AI_*`, `IMP_AO_*`, etc.) or replace with
+  `libsound`/`ALSA` equivalents.
+- The WebRTC audio processing library (`libaudioProcess.so`) is a
+  precompiled MIPS blob — either use as-is or replace with a mainline
+  WebRTC build.
+- Voice prompts (165 AAC files in `snd/`) can be reused directly.
+- The standalone `audio_play` binary can be used for AAC playback.
+
+### 12.6 Tag Partition
 
 Thingino must either:
 1. **Reimplement tag_generator** — understand the Ingenic tag partition
@@ -857,7 +1095,7 @@ Thingino must either:
 Option 2 is simpler for initial bring-up. The tag partition contains all
 the board-specific sensor tuning that is difficult to recreate.
 
-### 11.6 Partition Layout
+### 12.7 Partition Layout
 
 For a 16 MB SPI NOR flash, the Thingino firmware image should maintain
 compatibility with the stock layout:
@@ -876,7 +1114,7 @@ mtd5: data          (0xC20000 - 0x1000000,  4 MB)  [JFFS2 or UBIFS]
 
 ---
 
-## 12. Tools
+## 13. Tools
 
 All tools developed during this analysis are included in the `tools/`
 directory:
@@ -890,7 +1128,7 @@ Also available as a standalone repository:
 
 ---
 
-## 13. References
+## 14. References
 
 1. **Wladimir Palant** — *Unpacking VStarcam firmware for fun and profit*
    (December 2025) — Original documentation of the jzlzma algorithm:
