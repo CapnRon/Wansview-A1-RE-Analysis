@@ -1,6 +1,6 @@
 # Wansview A1 — Full Reverse Engineering Analysis
 
-**Camera model**: Wansview A1 (also branded as Ajcloud T-CP2011-W32A)  
+**Camera model**: Wansview A1  
 **Firmware file**: `wansview_a1-t23zn-atbm6461-stock.bin` (16 MB)  
 **SoC**: Ingenic T23N (xburst1, MIPS32 R1)  
 **Sensor**: OmniVision OS02G10 (2MP)  
